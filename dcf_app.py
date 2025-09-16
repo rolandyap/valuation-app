@@ -12,6 +12,160 @@ st.set_page_config(page_title="Valuation: DCF & DDM", page_icon="💹", layout="
 
 # ============================== Data helpers ==============================
 
+def format_with_commas(x, decimals=0):
+    try:
+        if x is None or not np.isfinite(float(x)):
+            return ""
+        if decimals == 0:
+            return f"{float(x):,.0f}"
+        return f"{float(x):,.{decimals}f}"
+    except Exception:
+        return ""
+
+def parse_number(s: str, default=None):
+    if s is None:
+        return default
+    s = s.strip().replace(",", "")
+    if s == "":
+        return default
+    try:
+        return float(s)
+    except Exception:
+        return default
+    
+def fcf_series_from_yahoo(ticker: str) -> pd.Series | None:
+    """
+    Build an ANNUAL FCF series, most-recent-first, indexed by year.
+    Preference order:
+      (a) 'freecashflow' row from annual / quarterly cashflow tables
+      (b) fallback: OCF - CapEx from the same tables
+    """
+    t = yf.Ticker(ticker)
+
+    def _series_from_row(df: pd.DataFrame, row_key: str) -> pd.Series | None:
+        if df is None or df.empty:
+            return None
+        cf = _norm_index(df.copy())
+        if row_key not in cf.index:
+            return None
+        s = pd.to_numeric(cf.loc[row_key], errors="coerce").dropna()
+        if s.empty:
+            return None
+        # Yahoo uses columns as dates/periods
+        try:
+            idx = pd.to_datetime(s.index)
+        except Exception:
+            idx = s.index
+        return pd.Series(s.values, index=idx)
+
+    def _ocf_minus_capex(df: pd.DataFrame) -> pd.Series | None:
+        if df is None or df.empty:
+            return None
+        cf = _norm_index(df.copy())
+        ocf = capex = None
+        for k in ["totalcashfromoperatingactivities", "operatingcashflow"]:
+            if k in cf.index:
+                ocf = pd.to_numeric(cf.loc[k], errors="coerce")
+                break
+        for k in ["capitalexpenditures", "investmentsppecapex"]:
+            if k in cf.index:
+                capex = pd.to_numeric(cf.loc[k], errors="coerce")
+                break
+        if ocf is None or capex is None:
+            return None
+        s = (ocf - capex).dropna()
+        if s.empty:
+            return None
+        try:
+            idx = pd.to_datetime(s.index)
+        except Exception:
+            idx = s.index
+        return pd.Series(s.values, index=idx)
+
+    # Try annual 'freecashflow' row
+    s = _series_from_row(t.cashflow, "freecashflow")
+    # Else quarterly 'freecashflow' row
+    if s is None:
+        s = _series_from_row(getattr(t, "quarterly_cashflow", None), "freecashflow")
+    # Else annual OCF - CapEx
+    if s is None:
+        s = _ocf_minus_capex(t.cashflow)
+    # Else quarterly OCF - CapEx
+    if s is None:
+        s = _ocf_minus_capex(getattr(t, "quarterly_cashflow", None))
+
+    if s is None or s.empty:
+        return None
+
+    s = s.sort_index(ascending=False)
+    # roll up to years (sum quarters or keep annual)
+    s_year = s.groupby(s.index.year).sum()
+    return s_year
+
+def infer_fcf_avg_from_ticker(ticker: str, years: int,
+                              market_cap: float | None,
+                              revenue: float | None = None) -> float | None:
+    """
+    Average of last N *scaled* annual FCF values.
+    Each year's value is individually scaled vs revenue to correct thousand/million mixups.
+    """
+    ser = fcf_series_from_yahoo(ticker)
+    if ser is None or ser.empty:
+        return None
+
+    # scale each year first, then average
+    vals = []
+    for v in ser.head(years).astype(float).values:
+        vv, _ = scale_if_thousands(float(v), market_cap, revenue)
+        vals.append(vv)
+
+    if not vals:
+        return None
+    return float(np.mean(vals))
+
+# ---- heuristics to fix Yahoo "values in thousands" issue ----
+def approx_market_cap(price, shares):
+    try:
+        if price and shares:
+            return float(price) * float(shares)
+    except Exception:
+        pass
+    return None
+
+def fetch_revenue(ticker: str):
+    try:
+        t = yf.Ticker(ticker)
+        fin = t.financials
+        if fin is not None and not fin.empty:
+            fin = _norm_index(fin)
+            if "totalrevenue" in fin.index:
+                s = pd.to_numeric(fin.loc["totalrevenue"], errors="coerce").dropna()
+                if not s.empty:
+                    return float(s.iloc[0])
+    except Exception:
+        pass
+    return None
+
+def scale_if_thousands(val, mktcap=None, revenue=None):
+    """
+    Fix Yahoo 'values in thousands' problems using revenue as the primary anchor.
+    We scale PER VALUE (used for series and single numbers).
+    """
+    if val is None or not np.isfinite(val) or val == 0:
+        return val, False
+
+    # Scale UP if clearly too small
+    if revenue and abs(val) < 0.005 * revenue:      # <0.5% of revenue
+        return val * 1000.0, True
+    if mktcap and abs(val) < 0.0005 * (mktcap or 0): # <0.05% of market cap
+        return val * 1000.0, True
+
+    # Scale DOWN if clearly too large (use revenue only; avoid cap-based false positives)
+    if revenue and abs(val) > 0.80 * revenue:       # >80% of revenue is suspicious for FCF
+        return val / 1000.0, True
+
+    return val, False
+
 def get_company_name(ticker: str):
     try:
         info = yf.Ticker(ticker).get_info()
@@ -91,20 +245,22 @@ def _norm_index(df: pd.DataFrame):
     return df
 
 
-def infer_fcf(cashflow_df: pd.DataFrame):
-    """Try direct FreeCashFlow, else OCF - CapEx."""
+def infer_fcf(cashflow_df: pd.DataFrame, market_cap: float = None, revenue: float = None):
     if cashflow_df is None or cashflow_df.empty:
         return None
     cf = _norm_index(cashflow_df)
 
+    # Try Free Cash Flow row
     for key in ["freecashflow", "freecashflowttm", "freecashflow(annual)"]:
         if key in cf.index:
             s = pd.to_numeric(cf.loc[key], errors="coerce").dropna()
             if not s.empty:
-                return float(s.iloc[0])
+                raw = float(s.iloc[0])
+                val, scaled = scale_if_thousands(raw, market_cap, revenue)
+                return val
 
-    ocf = None
-    capex = None
+    # Try OCF - CapEx
+    ocf = capex = None
     for k in ["totalcashfromoperatingactivities", "operatingcashflow"]:
         if k in cf.index:
             ocf = pd.to_numeric(cf.loc[k], errors="coerce").dropna()
@@ -114,12 +270,36 @@ def infer_fcf(cashflow_df: pd.DataFrame):
             capex = pd.to_numeric(cf.loc[k], errors="coerce").dropna()
             break
     if ocf is not None and capex is not None and not ocf.empty and not capex.empty:
-        return float((ocf - capex).iloc[0])
+        raw = float((ocf - capex).iloc[0])
+        val, scaled = scale_if_thousands(raw, market_cap, revenue)
+        return val
+
     return None
 
+def infer_fcf_avg(cashflow_df: pd.DataFrame, years: int = 5, market_cap: float = None, revenue: float = None):
+    if cashflow_df is None or cashflow_df.empty:
+        return None
+    cf = _norm_index(cashflow_df)
 
-def infer_cash_plus_sti(balance_df: pd.DataFrame):
-    """Cash + short-term investments."""
+    ocf = capex = None
+    for k in ["totalcashfromoperatingactivities", "operatingcashflow"]:
+        if k in cf.index:
+            ocf = pd.to_numeric(cf.loc[k], errors="coerce").dropna()
+            break
+    for k in ["capitalexpenditures", "investmentsppecapex"]:
+        if k in cf.index:
+            capex = pd.to_numeric(cf.loc[k], errors="coerce").dropna()
+            break
+
+    if ocf is not None and capex is not None:
+        fcf_series = (ocf - capex).dropna().astype(float)
+        if not fcf_series.empty:
+            avg = fcf_series.head(years).mean()
+            val, scaled = scale_if_thousands(avg, market_cap, revenue)
+            return val
+    return None
+
+def infer_cash_plus_sti(balance_df: pd.DataFrame, market_cap: float = None):
     if balance_df is None or balance_df.empty:
         return None
     bs = _norm_index(balance_df)
@@ -136,22 +316,24 @@ def infer_cash_plus_sti(balance_df: pd.DataFrame):
             s = pd.to_numeric(bs.loc[k], errors="coerce").dropna()
             if not s.empty:
                 sti = float(s.iloc[0]); break
+
     if cash is None and sti == 0.0:
         return None
-    return (cash or 0.0) + sti
+    raw = (cash or 0.0) + sti
+    val, scaled = scale_if_thousands(raw, market_cap)
+    return val
 
 
-def infer_total_debt(balance_df: pd.DataFrame):
-    """Total debt if present; else ST + LT debt."""
+def infer_total_debt(balance_df: pd.DataFrame, market_cap: float = None):
+    """
+    Use interest-bearing debt only: ST + LT.
+    Avoid Yahoo's 'totaldebt' if it looks inflated (could include liabilities).
+    """
     if balance_df is None or balance_df.empty:
         return None
     bs = _norm_index(balance_df)
 
-    if "totaldebt" in bs.index:
-        s = pd.to_numeric(bs.loc["totaldebt"], errors="coerce").dropna()
-        if not s.empty:
-            return float(s.iloc[0])
-
+    # Build from components first
     st_debt = 0.0
     lt_debt = 0.0
     for k in ["shortlongtermdebt", "shorttermdebt", "currentportionoflongtermdebt"]:
@@ -164,10 +346,21 @@ def infer_total_debt(balance_df: pd.DataFrame):
             s = pd.to_numeric(bs.loc[k], errors="coerce").dropna()
             if not s.empty:
                 lt_debt = float(s.iloc[0]); break
-    if st_debt == 0.0 and lt_debt == 0.0:
-        return None
-    return st_debt + lt_debt
+    comp = st_debt + lt_debt
 
+    # If components missing, cautiously try 'totaldebt'
+    if comp == 0.0 and "totaldebt" in bs.index:
+        s = pd.to_numeric(bs.loc["totaldebt"], errors="coerce").dropna()
+        if not s.empty:
+            raw = float(s.iloc[0])
+            val, scaled = scale_if_thousands(raw, market_cap)
+            return val
+
+    if comp > 0:
+        val, scaled = scale_if_thousands(comp, market_cap)
+        return val
+
+    return None
 
 def dividends_ttm(div_series: pd.Series):
     """Return trailing-12M dividends per share, fallback to last FY."""
@@ -331,12 +524,39 @@ with st.sidebar:
 
     st.divider()
     st.subheader("FCF / Cash / Debt / Shares")
-    source = st.radio("Data source", ["Yahoo (auto)", "Manual override"], horizontal=True)
-    if source == "Manual override":
-        fcf0_in = st.number_input("Current FCF ($)", value=2_032_700_000.0, step=50_000_000.0, format="%.0f")
-        cash_in = st.number_input("Cash + short-term investments ($)", value=4_562_900_000.0, step=50_000_000.0, format="%.0f")
-        debt_in = st.number_input("Total debt ($)", value=995_300_000.0, step=50_000_000.0, format="%.0f")
-        shrs_in = st.number_input("Shares outstanding", value=772_700_000.0, step=1_000_000.0, format="%.0f")
+    
+    fcf_source = st.radio(
+        "FCF basis",
+        ["Latest (TTM)", "5-year average", "Manual override"],
+        horizontal=False
+    )
+    
+   # --- Manual override with Yahoo prefills + comma-friendly text inputs ---
+    if fcf_source == "Manual override":
+        # Pull Yahoo to prefill (same as before)
+        data_prefill = fetch_yahoo_all(ticker.strip())
+        price_pref   = data_prefill["price"]
+        shares_pref  = data_prefill["shares"]
+        mktcap_pref  = approx_market_cap(price_pref, shares_pref)
+
+        fcf_pref  = infer_fcf(data_prefill["cashflow"], mktcap_pref) or 0.0
+        cash_pref = infer_cash_plus_sti(data_prefill["balancesheet"], mktcap_pref) or 0.0
+        debt_pref = infer_total_debt(data_prefill["balancesheet"], mktcap_pref) or 0.0
+        shrs_pref = float(shares_pref or 0.0)
+
+        st.caption("You can paste numbers with commas (e.g., 2,470,000,000). Decimals are OK.")
+
+        # Show as text_input so commas are allowed; prefill with nicely formatted strings
+        fcf0_in_str = st.text_input("Current FCF ($)", value=format_with_commas(fcf_pref, 0))
+        cash_in_str = st.text_input("Cash + short-term investments ($)", value=format_with_commas(cash_pref, 0))
+        debt_in_str = st.text_input("Total debt ($)", value=format_with_commas(debt_pref, 0))
+        shrs_in_str = st.text_input("Shares outstanding", value=format_with_commas(shrs_pref, 0))
+
+        # Convert back to floats; if user clears a field, fall back to the prefill
+        fcf0_in = parse_number(fcf0_in_str, default=fcf_pref)
+        cash_in = parse_number(cash_in_str, default=cash_pref)
+        debt_in = parse_number(debt_in_str, default=debt_pref)
+        shrs_in = parse_number(shrs_in_str, default=shrs_pref)
     else:
         fcf0_in = cash_in = debt_in = shrs_in = None
 
@@ -359,10 +579,50 @@ except Exception:
     
 price = data["price"]
 shares = data["shares"] if shrs_in is None else shrs_in
-fcf0   = infer_fcf(data["cashflow"]) if fcf0_in is None else fcf0_in
-cash   = infer_cash_plus_sti(data["balancesheet"]) if cash_in is None else cash_in
-debt   = infer_total_debt(data["balancesheet"]) if debt_in is None else debt_in
+mktcap = approx_market_cap(price, shares)
+revenue = fetch_revenue(ticker.strip())
 
+if fcf_source == "Latest (TTM)":
+    # Keep your current logic (annual row or OCF–CapEx from annual table)
+    fcf0 = infer_fcf(data["cashflow"], mktcap,revenue)
+elif fcf_source == "5-year average":
+    # New robust path: builds annual series from annual OR quarterly tables
+    fcf0 = infer_fcf_avg_from_ticker(ticker.strip(), years=5, market_cap=mktcap,revenue=revenue)
+elif fcf_source == "Manual override":
+    fcf0 = fcf0_in
+
+with st.expander("Debug (FCF scaling)", expanded=False):
+    st.write(f"Market cap (approx): {fmt_money(mktcap)}")
+    st.write(f"Revenue (latest): {fmt_money(revenue)}")
+    ser_dbg = fcf_series_from_yahoo(ticker.strip())
+    if ser_dbg is not None and not ser_dbg.empty:
+        raw = ser_dbg.head(5).rename("FCF raw/yr")
+        scaled_vals = [scale_if_thousands(float(v), mktcap, revenue)[0] for v in raw.values]
+        scaled = pd.Series(scaled_vals, index=raw.index, name="FCF scaled/yr")
+        st.dataframe(pd.concat([raw, scaled], axis=1).style.format("${:,.0f}"))
+    st.write(f"Base FCF used (after scaling/avg if chosen): {fmt_money(fcf0)}")
+
+cash = infer_cash_plus_sti(data["balancesheet"], mktcap) if cash_in is None else cash_in
+debt = infer_total_debt(data["balancesheet"], mktcap) if debt_in is None else debt_in
+
+if fcf_source == "5-year average":
+    ser_dbg = fcf_series_from_yahoo(ticker.strip())
+    if ser_dbg is None or ser_dbg.empty:
+        st.warning("Yahoo has no usable cash-flow for this ticker. Falling back to Net Income proxy or please use Manual override.")
+    else:
+        st.caption("FCF used = 5-yr avg of annual FCF (OCF − CapEx). Raw series below (pre-scale):")
+        st.dataframe(ser_dbg.head(6).to_frame("Annual FCF (raw)").style.format("${:,.0f}"), use_container_width=True)
+                    
+
+
+
+if mktcap and cash and cash > mktcap:
+    st.warning("⚠️ Cash > Market Cap. Yahoo scaling may still be off; consider Manual override.")
+if mktcap and debt and debt > 2 * mktcap:
+    st.warning("⚠️ Debt ≫ Market Cap. Yahoo may be returning total liabilities; use Manual override.")
+if shares and shares > 10_000_000_000:
+    st.info("ℹ️ Shares outstanding looks very high. If this seems wrong, use Manual override for shares.")
+    
 missing = []
 if price is None:  missing.append("price")
 if shares is None: missing.append("shares")
